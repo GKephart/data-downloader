@@ -1,0 +1,379 @@
+<?php
+
+require_once(dirname(dirname(__DIR__)) . "/php/classes/autoload.php");
+require_once(dirname(dirname(dirname(__DIR__))) . "/vendor/autoload.php");
+require_once("/var/www/trailquail/encrypted-mysql/encrypted-config.php");
+
+// composer packages
+use Symm\Gisconverter\Gisconverter;
+use Location\Coordinate;
+use Location\Polyline;
+use Location\Distance\Vincenty;
+
+/**
+ * This class will download date from the City of Albuquerque Open-Trails Database.
+ * This class can be modified to grab data from the databases of other cities using the open-trails specification.
+ *
+ * @author Matt Harris mattharr505@gmail.com
+ *
+ **/
+class DataDownloader {
+
+	/**
+	 * named trails:http://data.cabq.gov/community/opentrails/named_trails.csv
+	 * trail segments: http://data.cabq.gov/community/opentrails/trail_segments.geojson
+	 *
+	 **/
+
+	/**
+	 *
+	 * Gets the metadata from a file
+	 *
+	 * @param string %url to grab from
+	 * @param int $redirect whether to redirect or not
+	 * @return mixed stream data
+	 * @throws Exception if file doesn't exist.
+	 **/
+	public static function getMetaData($url, $redirect = 1) {
+		//stream_context_create creates the stream needed to download trail information from the city of Albuquerque
+		$context = stream_context_create(array("http" => array("follow_location" => $redirect, "ignore_errors" => true, "method" => "HEAD")));
+
+		//"@" suppresses warnings and errors, fopen opens the actual file or Url
+		$fd = @fopen($url, "rb", false, $context);
+
+		//grab the stream meta data
+		$streamData = stream_get_meta_data($fd);
+
+//  Closes the file or url
+		fclose($fd);
+
+		// set the wrapperData to an array of wrapperData
+		$wrapperData = $streamData["wrapper_data"];
+
+		//loop through and find the "HTTP" attribute
+		$http = "";
+		foreach($wrapperData as $data) {
+			if(strpos($data, "HTTP") !== false) {
+				$http = $data;
+				break;
+			}
+		}
+
+		// throw exceptions if any errors occur while opening the stream
+		if(strpos($http, "400")) {
+			throw (new Exception("Bad request"));
+		}
+		if(strpos($http, "401")) {
+			throw (new Exception ("Unauthorized"));
+		}
+		if(strpos($http, "403")) {
+			throw (new Exception ("Forbidden"));
+		}
+		if(strpos($http, "404")) {
+			throw (new Exception("Not Found"));
+		}
+		if(strpos($http, "418")) {
+			throw(new Exception("Get your tea set"));
+		}
+
+		return $streamData;
+	}
+
+	/**
+	 *This function grabs the named_trails.csv file and reads it then creates trail obejects from the contents of the .csv file
+	 *
+	 * @param string $url url to grab file at
+	 * @throws PDOException PDO related errors
+	 * @throws Exception catch-all exception
+	 **/
+	public static function readNamedTrailsCSV($url) {
+
+		//stream_context_create creates the stream needed to download trail information from the city of Albuquerque
+		$context = stream_context_create(array("http" => array("ignore_errors" => true, "method" => "GET")));
+		// try the actual download from the .csv file
+		try {
+			//connect to the database
+			$pdo = connectToEncryptedMySQL("/var/www/trailquail/encrypted-mysql/trailquail.ini");
+
+			// set $fd to the fopen method and define needed arguements for fopen
+			if(($fd = @fopen($url, "rb", false, $context)) !== false) {
+
+				//file get csv http://php.net/manual/en/function.fgetcsv.php
+				fgetcsv($fd, 0, ",");
+				//while loop will run as long as there are more trails to be added
+				while((($data = fgetcsv($fd, 0, ",", "\"")) !== false) && feof($fd) !== true) {
+					$trailId = null;
+					$userId = 1;
+					$browser = "Default";
+					$createDate = new DateTime();
+					$ipAddress = "::1";
+					$submitTrailId = null;
+					$trailAmenities = "This trail currently has no amenities information. If you are familiar with this trail, please use the submission form to help us out! Thank you.";
+					$trailCondition = "This trail currently has no condition information. If you are familiar with this trail, please use the submission form to help us out! Thank you.";
+					$trailDescription = "";
+					$trailDifficulty = 2;
+					$trailDistance = 0;
+					$trailName = $data[1];
+					$trailSubmissionType = 2;
+					$trailTerrain = "Unknown";
+					$trailTraffic = "Unknown";
+					$trailUse = "Unknown";
+					$trailUuid = null;
+					//sets trail description based on available data, if none is available create a place holder for it
+					if(strlen($data[3]) <= 0) {
+						$trailDescription = "This trail currently has no description information. If you are familiar with this trail, please use the submission form to help us out! Thank you.";
+					} else {
+						$trailDescription = $data[3];
+					}
+					//before each individual loop terminates take needed trail information and create the individual trails
+					try {
+						$trail = new Trail(null, $userId, $browser, $createDate, $ipAddress, $submitTrailId, $trailAmenities, $trailCondition, $trailDescription, $trailDifficulty, $trailDistance, $trailName, $trailSubmissionType, $trailTerrain, $trailTraffic, $trailUse, $trailUuid);
+						$trail->insert($pdo);
+					}
+						// catch any excep that might occur
+					catch(PDOException $pdoException) {
+						$sqlStateCode = "23000";
+						echo "I knew there was a catch somewhere :" . $pdoException->getMessage() . PHP_EOL;
+
+						$errorInfo = $pdoException->errorInfo;
+						if($errorInfo [0] === $sqlStateCode) {
+						} else {
+							throw (new PDOException($pdoException->getMessage(), 0, $pdoException));
+						}
+					} catch(Exception $exception) {
+						throw (new Exception ($exception->getMessage(), 0, $exception));
+					}
+				}
+				//close the csv file
+				fclose($fd);
+			}
+		} catch(PDOException $pdoException) {
+			throw (new PDOException($pdoException->getMessage(), 0, $pdoException));
+		} catch(Exception $exception) {
+			throw(new Exception ($exception->getMessage(), 0, $exception));
+		}
+	}
+
+	/**
+	 *
+	 * Decodes geoJson file, converts to string, sifts through the string and inserts the data into the database
+	 *
+	 * @param string $url
+	 * @throws PDOException PDO related errors
+	 * @throws Exception catch-all exception
+	 **/
+	public static function readTrailSegmentsGeoJson($url) {
+
+		// http://php.net/manual/en/function.stream-context-create.php creates a stream for file input
+		$context = stream_context_create(array("http" => array("ignore_errors" => true, "method" => "GET")));
+
+		try {
+			$pdo = connectToEncryptedMySQL("/var/www/trailquail/encrypted-mysql/trailquail.ini");
+
+			// http://php.net/manual/en/function.file-get-contents.php file-get-contents returns file in string context
+			if(($jsonData = file_get_contents($url, null, $context)) !== false) {
+
+				if(($jsonFd = @fopen("php://memory", "wb+")) === false) {
+					throw(new RuntimeException("Memory Error: I can't remember"));
+				}
+
+				//decode the geoJson file
+				$jsonConverted = json_decode($jsonData);
+				//format
+				$jsonFeatures = $jsonConverted->features;
+				// create array from converted geoJson file
+				$properties = new SplFixedArray(count($jsonFeatures));
+				//loop through array to get to json properties
+				foreach($jsonFeatures as $jsonFeature) {
+					$properties[$properties->key()] = $jsonFeature->properties;
+					$properties->next();
+				}
+				//create an array of trails and a SplObjectStorage for the trail guide
+				$trails = [];
+				$trailGuide = new SplObjectStorage();
+				//loop through array to get trail name and trail use
+				foreach($properties as $property) {
+					$trailName = $property->name;
+					$trailUse = "";
+
+					//set $trailUse string based on information in geoJson properties field.
+					if($property->bicycle === "yes") {
+						$trailUse = $trailUse . "bicycle: yes, ";
+					} else {
+						$trailUse = $trailUse . "bicycle: no, ";
+					}
+					if($property->foot === "yes") {
+						$trailUse = $trailUse . "foot: yes, ";
+					} else {
+						$trailUse = $trailUse . "foot: no, ";
+					}
+					if($property->wheelchair === "yes") {
+						$trailUse = $trailUse . "wheelchair: yes ";
+					} else {
+						$trailUse = $trailUse . "wheelchair: no ";
+					}
+					//get the trail by name and set the trail use
+					try {
+						$candidateTrails = Trail::getTrailByTrailName($pdo, $trailName);
+						foreach($candidateTrails as $trail) {
+							$trail->setTrailUse($trailUse);
+							$trail->update($pdo);
+							$trails[] = $trail;
+						}
+						// catch any errors that might occur
+					} catch(PDOException $pdoException) {
+						$sqlStateCode = "23000";
+
+						$errorInfo = $pdoException->errorInfo;
+						if($errorInfo [0] === $sqlStateCode) {
+						} else {
+							throw (new PDOException($pdoException->getMessage(), 0, $pdoException));
+						}
+					} catch(Exception $exception) {
+						throw (new Exception ($exception->getMessage(), 0, $exception));
+					}
+				}
+
+				try {
+					$trailIndex = 0;
+					//loop through each individual feature
+					foreach($jsonFeatures as $jsonFeature) {
+
+
+						// if cordinates are for a single segment of trails
+						$jsonCoordinates = $jsonFeature->geometry->coordinates;
+						if($jsonFeature->geometry->type === "LineString") {
+							$coordinates = new SplFixedArray(count($jsonCoordinates));
+							// loop through all the coordinates of the line string
+							foreach($jsonCoordinates as $coordinate) {
+								$coordinates[$coordinates->key()] = $coordinate;
+								$coordinates->next();
+							}
+
+							$trailGuide[$trails[$trailIndex]] = $coordinates;
+							$trailIndex++;
+
+							// if there are multiple segments (routes) breakup the MultiLineString
+						} else if($jsonFeature->geometry->type === "MultiLineString") {
+							$trailClones = [];
+							//index
+							$trails[$trailIndex]->delete($pdo);
+							for($i = 1; $i <= count($jsonCoordinates); $i++) {
+								$trail = clone $trails[$trailIndex];
+								$trail->setTrailId(null);
+								$trail->setTrailName($trail->getTrailName() . " $i");
+								$trail->insert($pdo);
+								$trailClones[] = $trail;
+							}
+
+							//http://php.net/manual/en/function.array-splice.php
+							array_splice($trails, $trailIndex, 1, $trailClones);
+
+
+							foreach($jsonCoordinates as $lineCoordinates) {
+								//set line cordiantes to trailindex
+								$trailGuide[$trails[$trailIndex]] = $lineCoordinates;
+								$trailIndex++;
+							}
+						}
+					}
+
+					//http://php.net/manual/en/function.reset.php sets trailguide array pointer back to 0
+					$trailGuide->rewind();
+					foreach($trailGuide as $map) {
+						//http://php.net/manual/en/function.current.php returns current array index
+						$trail = $trailGuide->current();
+
+						$geo = $trailGuide->getInfo();
+						//loop throught the array to begin buillding segment objects
+						for($indexTwo = 0; $indexTwo < count($geo) - 1; $indexTwo++) {
+
+							//begin formating data for creating segment objects
+							$segmentStartX = $geo[$indexTwo][0];
+							$segmentStartY = $geo[$indexTwo][1];
+
+							$segmentStopX = $geo[$indexTwo + 1][0];
+							$segmentStopY = $geo[$indexTwo + 1][1];
+
+							$segmentStart = new Point ($segmentStartX, $segmentStartY);
+							$segmentStop = new Point ($segmentStopX, $segmentStopY);
+							try {
+								//try creating and inserting segment objects and relationship
+								$segment = new Segment(null, $segmentStart, $segmentStop, 0, 0);
+								$segment->insert($pdo);
+								$relationship = new TrailRelationship($segment->getSegmentId(), $trail->getTrailId(), "T");
+								$relationship->insert($pdo);
+
+							} //setup exception handling
+							catch(PDOException $pdoException) {
+								$sqlStateCode = "23000";
+
+								$errorInfo = $pdoException->errorInfo;
+								if($errorInfo [0] === $sqlStateCode) {
+								} else {
+									throw (new PDOException($pdoException->getMessage(), 0, $pdoException));
+								}
+							} catch(Exception $exception) {
+								throw (new Exception ($exception->getMessage(), 0, $exception));
+							}
+						}
+					}
+				} catch(PDOException $pdoException) {
+					$sqlStateCode = "23000";
+
+					$errorInfo = $pdoException->errorInfo;
+					if($errorInfo [0] === $sqlStateCode) {
+					} else {
+						throw (new PDOException($pdoException->getMessage(), 0, $pdoException));
+					}
+				} catch(Exception $exception) {
+					throw (new Exception ($exception->getMessage(), 0, $exception));
+				}
+			}
+
+			//close the file stream
+			fclose($jsonFd);
+		} catch
+		(PDOException $pdoException) {
+			throw (new PDOException($pdoException->getMessage(), 0, $pdoException));
+		} catch
+		(Exception $exception) {
+			throw (new Exception ($exception->getMessage(), 0, $exception));
+		}
+	}
+
+
+	/**
+	 * calculates trail distance using phpgeo composer package.
+	 * project specfic method
+	 *
+	 **/
+	public static function calculateTrailDistance() {
+		$pdo = connectToEncryptedMySQL("/var/www/trailquail/encrypted-mysql/trailquail.ini");
+		$trails = Trail::getAllTrails($pdo);
+
+		$testNum = 0;
+		foreach($trails as $trail) {
+			$testNum++;
+			$trailRelationships = TrailRelationship::getTrailRelationshipByTrailId($pdo, $trail->getTrailId());
+
+			$track = new Polyline();
+			foreach($trailRelationships as $trailRelationship) {
+				$segment = Segment::getSegmentBySegmentId($pdo, $trailRelationship->getSegmentId());
+				$track->addPoint(new Coordinate($segment->getSegmentStart()->getY(), $segment->getSegmentStart()->getX()));
+				$track->addPoint(new Coordinate($segment->getSegmentStop()->getY(), $segment->getSegmentStop()->getX()));
+			}
+
+			$trailDistanceM = $track->getLength(new Vincenty());
+			$trailDistanceMi = $trailDistanceM / 1609.344;
+			$trailDistance = $trailDistanceMi;
+			$trail->setTrailDistance($trailDistance);
+			$trail->update($pdo);
+		}
+	}
+}
+
+
+DataDownloader::readNamedTrailsCSV("http://data.cabq.gov/community/opentrails/named_trails.csv");
+DataDownloader::readTrailSegmentsGeoJson("http://data.cabq.gov/community/opentrails/trail_segments.geojson");
+DataDownloader::calculateTrailDistance();
